@@ -4,12 +4,9 @@ import re
 import random
 from typing import Optional, Tuple, List
 from collections import Counter
-from pydfs_lineup_optimizer import get_optimizer, Site, Sport, Player, PositionsStack
-from pydfs_lineup_optimizer.stacks import GameStack
+from pydfs_lineup_optimizer import get_optimizer, Site, Sport, Player, AfterEachExposureStrategy
+from pydfs_lineup_optimizer.stacks import PositionsStack, GameStack
 from pydfs_lineup_optimizer.fantasy_points_strategy import RandomFantasyPointsStrategy
-from pydfs_lineup_optimizer.exposure_strategy import AfterEachExposureStrategy
-
-st.set_page_config(page_title="The Betting Block DFS Optimizer", layout="wide")
 
 # --- Config / mappings ---
 SITE_MAP = {
@@ -103,135 +100,6 @@ def player_display_name(p) -> str:
     if full: return full
     return str(p)
 
-# --- Diversification Logic ---
-def diversify_lineups_wide(
-    df_wide, salary_df,
-    max_exposure=0.4,
-    max_pair_exposure=0.6,
-    randomness=0.15,
-    salary_cap=50000,
-    salary_min=49500
-):
-    diversified = df_wide.copy()
-    total_lineups = len(diversified)
-    
-    # Build salary + projection lookup
-    player_info = {}
-    for _, row in salary_df.iterrows():
-        try:
-            fppg = float(row.get("AvgPointsPerGame", 0))
-            if fppg < 0:
-                fppg = 0  # Replace negative FPPG with 0
-            player_info[row["Name"]] = {
-                "team": str(row.get("TeamAbbrev", "")),
-                "salary": float(row.get("Salary", 0)),
-                "fppg": fppg,
-                "position": str(row.get("Position", ""))
-            }
-        except (ValueError, TypeError):
-            st.warning(f"Invalid data for {row['Name']}: {row.to_dict()}. Skipping.")
-            continue
-    
-    # Initialize exposure counters
-    exposure = Counter()
-    pair_exposure = Counter()
-    
-    # Calculate initial exposures
-    for i in range(total_lineups):
-        lineup_players = []
-        for col in diversified.columns:
-            if col in ["TotalSalary", "ProjectedPoints"]:
-                continue
-            val = diversified.at[i, col]
-            if isinstance(val, str):
-                name = val.split("(")[0].strip()
-                if name in player_info:  # Ensure player exists
-                    exposure[name] += 1
-                    lineup_players.append(name)
-        for a in range(len(lineup_players)):
-            for b in range(a + 1, len(lineup_players)):
-                pair_exposure[tuple(sorted([lineup_players[a], lineup_players[b]]))] += 1
-    
-    # Diversify
-    for lineup_idx in range(total_lineups):
-        lineup_players = [
-            diversified.at[lineup_idx, c].split("(")[0].strip()
-            for c in diversified.columns
-            if c not in ["TotalSalary", "ProjectedPoints"] and isinstance(diversified.at[lineup_idx, c], str)
-            and diversified.at[lineup_idx, c].split("(")[0].strip() in player_info
-        ]
-        for col in diversified.columns:
-            if col in ["TotalSalary", "ProjectedPoints"]:
-                continue
-            val = diversified.at[lineup_idx, col]
-            if not isinstance(val, str):
-                continue
-            name = val.split("(")[0].strip()
-            if name not in player_info:
-                continue
-            player_exp = exposure[name] / total_lineups
-            lineup_pairs = [tuple(sorted([name, p])) for p in lineup_players if p != name]
-            pair_flags = [pair_exposure[pair] / total_lineups > max_pair_exposure for pair in lineup_pairs]
-            
-            if player_exp > max_exposure or any(pair_flags):
-                if random.random() < randomness:
-                    # Find replacement candidates with same position
-                    current_pos = player_info[name]["position"]
-                    possible_replacements = [
-                        p for p in player_info.keys()
-                        if p != name and player_info[p]["position"] == current_pos
-                    ]
-                    random.shuffle(possible_replacements)
-                    for candidate in possible_replacements:
-                        temp_lineup = diversified.loc[lineup_idx].copy()
-                        temp_lineup[col] = f"{candidate} ({player_info[candidate]['team']})"
-                        
-                        # Recalculate totals and validate position counts
-                        lineup_salary, lineup_points = 0, 0
-                        temp_players = []
-                        pos_counts = {"QB": 0, "RB": 0, "WR": 0, "TE": 0, "DST": 0}
-                        for pos in diversified.columns:
-                            if pos in ["TotalSalary", "ProjectedPoints"]:
-                                continue
-                            val2 = temp_lineup[pos]
-                            if isinstance(val2, str):
-                                nm = val2.split("(")[0].strip()
-                                if nm in player_info:
-                                    temp_players.append(nm)
-                                    lineup_salary += player_info[nm]["salary"]
-                                    lineup_points += player_info[nm]["fppg"]
-                                    pos_counts[player_info[nm]["position"]] += 1
-                        
-                        # Check salary and position constraints
-                        valid_positions = (
-                            pos_counts["QB"] == 1 and
-                            2 <= pos_counts["RB"] <= 3 and
-                            3 <= pos_counts["WR"] <= 4 and
-                            pos_counts["TE"] == 1 and
-                            pos_counts["DST"] == 1
-                        )
-                        if salary_min <= lineup_salary <= salary_cap and valid_positions:
-                            new_pairs = [
-                                tuple(sorted([a, b]))
-                                for i, a in enumerate(temp_players)
-                                for b in temp_players[i+1:]
-                            ]
-                            if all((pair_exposure[pair] + 1) / total_lineups <= max_pair_exposure for pair in new_pairs):
-                                # Accept replacement
-                                diversified.loc[lineup_idx, col] = f"{candidate} ({player_info[candidate]['team']})"
-                                diversified.at[lineup_idx, "TotalSalary"] = lineup_salary
-                                diversified.at[lineup_idx, "ProjectedPoints"] = lineup_points
-                                # Update exposures
-                                exposure[name] -= 1
-                                exposure[candidate] += 1
-                                for pair in lineup_pairs:
-                                    pair_exposure[pair] -= 1
-                                for pair in new_pairs:
-                                    pair_exposure[pair] += 1
-                                break
-    
-    return diversified
-
 # --- UI ---
 st.title("The Betting Block DFS Optimizer")
 st.write("Upload a salary CSV exported from DraftKings or FanDuel (NFL/NBA).")
@@ -252,16 +120,16 @@ st.dataframe(df.head(10))
 
 # --- Detect columns ---
 detected_site = guess_site_from_filename(getattr(uploaded_file, "name", None))
-id_col = find_column(df, ["id", "playerid", "player_id", "ID"])
-name_plus_id_col = find_column(df, ["name + id", "name+id", "name_plus_id", "name_id", "nameandid"])
-name_col = find_column(df, ["name", "full_name", "player"])
-first_col = find_column(df, ["first_name", "firstname", "first"])
-last_col = find_column(df, ["last_name", "lastname", "last"])
-pos_col = find_column(df, ["position", "positions", "pos", "roster position", "rosterposition", "roster_pos"])
-salary_col = find_column(df, ["salary", "salary_usd"])
-team_col = find_column(df, ["team", "teamabbrev", "team_abbrev", "teamabbr"])
-fppg_col = find_column(df, ["avgpointspergame", "avgpoints", "fppg", "projectedpoints", "proj"])
-game_info_col = find_column(df, ["game info", "gameinfo", "game"])
+id_col = find_column(df, ["id","playerid","player_id","ID"])
+name_plus_id_col = find_column(df, ["name + id","name+id","name_plus_id","name_id","nameandid"])
+name_col = find_column(df, ["name","full_name","player"])
+first_col = find_column(df, ["first_name","firstname","first"])
+last_col = find_column(df, ["last_name","lastname","last"])
+pos_col = find_column(df, ["position","positions","pos","roster position","rosterposition","roster_pos"])
+salary_col = find_column(df, ["salary","salary_usd"])
+team_col = find_column(df, ["team","teamabbrev","team_abbrev","teamabbr"])
+fppg_col = find_column(df, ["avgpointspergame","avgpoints","fppg","projectedpoints","proj"])
+game_info_col = find_column(df, ["game info","gameinfo","game"])
 
 guessed_sport = guess_sport_from_positions(df[pos_col]) if pos_col else None
 auto_choice = f"{detected_site} {guessed_sport}" if detected_site and guessed_sport and f"{detected_site} {guessed_sport}" in SITE_MAP else None
@@ -301,12 +169,12 @@ for idx, row in df.iterrows():
         elif name_col:
             parts = str(row[name_col]).split(" ", 1)
             first_name = parts[0].strip()
-            last_name = parts[1].strip() if len(parts) > 1 else "" if row[pos_col] != "DST" else row[name_col]
+            last_name = parts[1].strip() if len(parts) > 1 else ""
         elif name_plus_id_col:
             parsed_name, _ = parse_name_and_id_from_field(row[name_plus_id_col])
             parts = parsed_name.split(" ", 1)
             first_name = parts[0].strip()
-            last_name = parts[1].strip() if len(parts) > 1 else "" if row[pos_col] != "DST" else parsed_name
+            last_name = parts[1].strip() if len(parts) > 1 else ""
         else:
             first_name = str(row.get(name_col, f"Player{idx}"))
             last_name = ""
@@ -354,7 +222,7 @@ with col2:
     max_players_per_team = st.number_input("Max Players per Team", value=4, step=1)
     game_stack_size = st.slider("Game Stack Size (Players)", 0, 5, 0)
 
-use_advanced_constraints = st.checkbox("Use Advanced Constraints (QB+WR/TE/RB Stack, No Two RBs, WR+WR/TE/RB Opp Stack)", value=True)
+use_advanced_constraints = st.checkbox("Use Advanced Constraints (QB+WR/TE/RB Stack, No Two RBs, WR/TE/RB Opp Stack)", value=True)
 if use_advanced_constraints:
     col3, col4 = st.columns(2)
     with col3:
@@ -369,6 +237,8 @@ else:
 
 optimizer.set_min_salary_cap(min_salary)
 optimizer.set_max_players_from_team(max_players_per_team)
+optimizer.set_max_repeating_players(max_repeating_players)
+
 if qb_stack:
     optimizer.add_stack(PositionsStack(('QB', 'WR')))
     optimizer.add_stack(PositionsStack(('QB', 'TE')))
@@ -383,7 +253,6 @@ if opp_stack:
 if game_stack_size > 0:
     optimizer.add_stack(GameStack(game_stack_size))
 optimizer.set_fantasy_points_strategy(RandomFantasyPointsStrategy(max_deviation=0.05))
-optimizer.set_max_repeating_players(max_repeating_players)
 
 # --- Generate lineups ---
 gen_btn = st.button("Generate Lineups")
